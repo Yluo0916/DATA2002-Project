@@ -87,4 +87,164 @@ plot(allEffects(step.back.aic))
 # - Sulphates, pH: smaller positive/negative effects
 # - R² ≈ 0.36, Adj-R² ≈ 0.357 → good fit with fewer terms
 ```
+#D
+library(tidyverse)
+library(corrplot)
+library(ggplot2)
+library(gridExtra)
+library(readr)
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(PRROC)
+library(pdp)
+library(ggplot2)
+library(gridExtra)
+library(patchwork)
+library(yardstick)
+#PR curve and threshold selection
+pr_curve = pr.curve(scores.class0 = predictions[y_test == 1],
+                     scores.class1 = predictions[y_test == 0],
+                     curve = TRUE)
+pr_data = data.frame(
+  Recall = pr_curve$curve[, 1],
+  Precision = pr_curve$curve[, 2],
+  Threshold = pr_curve$curve[, 3]
+)
 
+# Find the optimal F1 threshold
+f1_scores <- 2 * (pr_data$Precision * pr_data$Recall) / (pr_data$Precision + pr_data$Recall)
+best_f1_idx <- which.max(f1_scores)
+best_threshold <- pr_data$Threshold[best_f1_idx]
+
+pr_plot <- ggplot(pr_data, aes(x = Recall, y = Precision)) +
+  geom_line(color = "darkgreen", linewidth = 1.2) +
+  geom_vline(xintercept = pr_data$Recall[best_f1_idx], 
+             linetype = "dashed", color = "red") +
+  geom_hline(yintercept = pr_data$Precision[best_f1_idx], 
+             linetype = "dashed", color = "red") +
+  geom_point(data = pr_data[best_f1_idx, ], 
+             aes(x = Recall, y = Precision), 
+             color = "red", size = 3) +
+  geom_text(aes(x = pr_data$Recall[best_f1_idx] + 0.1, 
+                y = pr_data$Precision[best_f1_idx] - 0.1),
+            label = paste("threshold value =", round(best_threshold, 3)),
+            color = "red", size = 4) +
+  labs(title = "Precision - recall curve (PR Curve)",
+       x = "Recall",
+       y = "Precision") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```{r}
+# S15: Error analysis and sensitivity
+cat("\n=== S15: Error analysis and sensitivity ===\n")
+
+# Re-predict using the optimal threshold
+final_predictions <- ifelse(predictions > best_threshold, 1, 0)
+
+# confusion matrix
+conf_matrix <- table(
+  Predicted = factor(final_predictions, levels = c(0, 1)),
+  Actual = factor(y_test, levels = c(0, 1))
+)
+
+cat("confusion matrix:\n")
+print(conf_matrix)
+
+# Calculate the indicators of various categories
+conf_matrix_df <- as.data.frame(conf_matrix)
+colnames(conf_matrix_df) <- c("Predicted", "Actual", "Count")
+
+conf_matrix_plot <- ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Count)) +
+  geom_tile(alpha = 0.8) +
+  geom_text(aes(label = Count), color = "white", size = 6) +
+  scale_fill_gradient(low = "blue", high = "red") +
+  labs(title = "confusion matrix",
+       x = "True category",
+       y = "Class prediction") +
+  theme_minimal()
+
+conf_matrix_plot
+
+# Analysis of Error Cases
+test_data_with_pred <- wine_data_clean[-train_index, ] %>%
+  mutate(
+    predicted = final_predictions,
+    probability = predictions,
+    error_type = case_when(
+      predicted == 1 & quality_binary == 0 ~ "False Positive",
+      predicted == 0 & quality_binary == 1 ~ "False Negative",
+      predicted == quality_binary ~ "Correct"
+    )
+  )
+
+# Analysis of Error Cases
+error_analysis <- test_data_with_pred %>%
+  filter(error_type != "Correct") %>%
+  group_by(error_type) %>%
+  summarise(
+    count = n(),
+    avg_alcohol = mean(alcohol),
+    avg_volatile_acidity = mean(volatile.acidity),
+    avg_sulphates = mean(sulphates),
+    avg_citric_acid = mean(citric.acid)
+  )
+
+cat("\nAnalysis of Error Cases:\n")
+print(error_analysis)
+
+# Save the first 20 error cases
+error_cases_top20 <- test_data_with_pred %>%
+  filter(error_type != "Correct") %>%
+  arrange(desc(abs(probability - 0.5))) %>%
+  head(20) %>%
+  select(fixed.acidity:alcohol, quality, quality_binary, predicted, probability, error_type)
+
+
+
+# Threshold sensitivity analysis
+thresholds <- seq(0.3, 0.7, 0.05)
+threshold_analysis <- map_df(thresholds, function(thresh) {
+  pred_class <- ifelse(predictions > thresh, 1, 0)
+  conf_matrix <- table(factor(pred_class, levels = c(0,1)), 
+                       factor(y_test, levels = c(0,1)))
+  
+  if(nrow(conf_matrix) == 2 && ncol(conf_matrix) == 2) {
+    precision <- conf_matrix[2,2] / sum(conf_matrix[2,])
+    recall <- conf_matrix[2,2] / sum(conf_matrix[,2])
+    f1 <- 2 * (precision * recall) / (precision + recall)
+    accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+  } else {
+    precision <- recall <- f1 <- accuracy <- 0
+  }
+  
+  data.frame(
+    Threshold = thresh,
+    Precision = precision,
+    Recall = recall,
+    F1 = f1,
+    Accuracy = accuracy
+  )
+})
+
+# Threshold sensitivity map
+threshold_plot <- threshold_analysis %>%
+  pivot_longer(cols = c(Precision, Recall, F1, Accuracy), 
+               names_to = "Metric", values_to = "Value") %>%
+  ggplot(aes(x = Threshold, y = Value, color = Metric)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = best_threshold, linetype = "dashed", color = "red") +
+  geom_point(data = threshold_analysis[threshold_analysis$Threshold == best_threshold, ] %>% 
+               pivot_longer(cols = c(Precision, Recall, F1, Accuracy), 
+                            names_to = "Metric", values_to = "Value"),
+             aes(x = Threshold, y = Value), size = 3) +
+  labs(title = "Threshold sensitivity analysis",
+       x = "classification threshold",
+       y = "indexscore") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+
+threshold_plot
+```
